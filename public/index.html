@@ -520,34 +520,22 @@ function initPhotoGrids() {
   });
 }
 window.addEventListener('load', function(){
-  // Try to load saved state from server first
   loadPageState(function() {
     setTimeout(initPhotoGrids, 200);
+    // On first load, migrate base64 images to server
+    setTimeout(migrateBase64Images, 500);
   });
 });
 
-// ===== FULL PAGE STATE PERSISTENCE (Vercel Blob API) =====
+// ===== SIMPLE PERSISTENCE =====
 var _saveTimer = null;
 var _saving = false;
+var _loaded = false;
 
 function scheduleAutoSave() {
+  if (!_loaded) return;
   if (_saveTimer) clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(function() { savePageState(); }, 1500);
-}
-
-function getPageHTML() {
-  // Remove toolbar and add-photo buttons before capturing
-  var toolbar = document.querySelector('.toolbar');
-  var addBtns = document.querySelectorAll('.add-photo-btn');
-  if (toolbar) toolbar.style.display = 'none';
-  addBtns.forEach(function(b) { b.style.display = 'none'; });
-
-  var html = document.documentElement.outerHTML;
-
-  if (toolbar) toolbar.style.display = '';
-  addBtns.forEach(function(b) { b.style.display = ''; });
-
-  return '<!DOCTYPE html>' + html;
+  _saveTimer = setTimeout(savePageState, 2000);
 }
 
 function getSlotId(slot) {
@@ -558,168 +546,120 @@ function getSlotId(slot) {
   return null;
 }
 
-function uploadImageToServer(slotId, base64data) {
+function uploadImg(slotId, base64) {
   return fetch('/api/upload', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ slotId: slotId, image: base64data })
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({slotId: slotId, image: base64})
   }).then(function(r) { return r.json(); });
 }
 
-function deleteImageFromServer(slotId) {
+function deleteImg(slotId) {
   fetch('/api/delete', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ slotId: slotId })
-  }).catch(function(e) { console.warn('Delete failed:', e); });
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({slotId: slotId})
+  }).catch(function() {});
+}
+
+// Migrate base64 images to Blob URLs one at a time
+function migrateBase64Images() {
+  var items = [];
+  document.querySelectorAll('.img-slot.has-img img').forEach(function(img) {
+    if (img.src && img.src.indexOf('data:') === 0) {
+      var slot = img.closest('.img-slot');
+      var sid = getSlotId(slot);
+      if (sid) items.push({img: img, sid: sid, src: img.src});
+    }
+  });
+  if (items.length === 0) { _loaded = true; savePageState(); return; }
+  var i = 0;
+  function next() {
+    if (i >= items.length) { _loaded = true; savePageState(); return; }
+    var item = items[i++];
+    uploadImg(item.sid, item.src).then(function(d) {
+      if (d && d.url) item.img.src = d.url;
+      setTimeout(next, 300);
+    }).catch(function() { setTimeout(next, 300); });
+  }
+  next();
 }
 
 function savePageState() {
   if (_saving) { scheduleAutoSave(); return; }
   _saving = true;
-
-  // Strip ALL image src before saving (images are stored separately in Blob)
   var toolbar = document.querySelector('.toolbar');
   var addBtns = document.querySelectorAll('.add-photo-btn');
   if (toolbar) toolbar.style.display = 'none';
   addBtns.forEach(function(b) { b.style.display = 'none'; });
-
-  // Save original src values, replace with placeholder
-  var imgData = [];
-  document.querySelectorAll('.img-slot.has-img img').forEach(function(img) {
-    imgData.push({ el: img, src: img.src });
-    img.setAttribute('data-src-stripped', '1');
-    img.removeAttribute('src');
-  });
-
   var html = '<!DOCTYPE html>' + document.documentElement.outerHTML;
-
-  // Restore src values immediately
-  imgData.forEach(function(d) {
-    d.el.src = d.src;
-    d.el.removeAttribute('data-src-stripped');
-  });
   if (toolbar) toolbar.style.display = '';
   addBtns.forEach(function(b) { b.style.display = ''; });
 
   fetch('/api/state', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ html: html })
-  }).then(function(r) { return r.json(); }).then(function(data) {
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({html: html})
+  }).then(function(r) { return r.json(); }).then(function(d) {
     _saving = false;
-    if (data.ok) console.log('State saved');
-    else console.warn('State save response:', data);
-  }).catch(function(e) {
-    _saving = false;
-    console.warn('Save failed:', e);
-  });
-}
-
-function restoreImagesFromServer() {
-  fetch('/api/images').then(function(r) { return r.json(); }).then(function(data) {
-    var slots = document.querySelectorAll('.img-slot');
-    Object.keys(data).forEach(function(key) {
-      if (key === 'page-state') return; // skip state file
-      var idx = parseInt(key.replace('slot_', ''), 10);
-      if (isNaN(idx) || idx >= slots.length) return;
-      var slot = slots[idx];
-      if (!slot.classList.contains('has-img')) return; // only fill slots marked has-img
-      var img = slot.querySelector('img');
-      if (img && (!img.src || img.hasAttribute('data-src-stripped') || img.src === window.location.href)) {
-        img.src = data[key];
-      } else if (!img && data[key]) {
-        img = document.createElement('img');
-        img.src = data[key];
-        slot.appendChild(img);
-      }
-    });
-    console.log('Images restored from server');
-  }).catch(function(e) { console.warn('Image restore failed:', e); });
+    console.log('Saved', d.ok ? 'ok' : d);
+  }).catch(function(e) { _saving = false; console.warn('Save fail:', e); });
 }
 
 function loadPageState(callback) {
   fetch('/api/state').then(function(r) { return r.json(); }).then(function(data) {
-    if (data.state && data.state.html && data.state.html.length > 500 && data.state.html.indexOf('class="hero"') !== -1) {
-      var parser = new DOMParser();
-      var doc = parser.parseFromString(data.state.html, 'text/html');
-      _observer.disconnect();
+    if (data.state && data.state.html && data.state.html.length > 1000 && data.state.html.indexOf('hero') !== -1) {
+      var doc = new DOMParser().parseFromString(data.state.html, 'text/html');
       document.body.innerHTML = doc.body.innerHTML;
-      console.log('State restored from server');
-      // Restore images from Blob storage
-      setTimeout(restoreImagesFromServer, 100);
-      setTimeout(function() {
-        _observer.observe(document.body, {
-          childList: true, subtree: true, characterData: true,
-          attributes: true, attributeFilter: ['class', 'contenteditable']
-        });
-      }, 1000);
-    } else {
-      // No saved state — first load, upload existing base64 images to server
-      setTimeout(function() {
-        var imgs = document.querySelectorAll('.img-slot.has-img img');
-        imgs.forEach(function(img) {
-          if (img.src && img.src.indexOf('data:') === 0) {
-            var slot = img.closest('.img-slot');
-            var sid = getSlotId(slot);
-            if (sid) {
-              uploadImageToServer(sid, img.src).then(function(d) {
-                if (d.url) img.src = d.url;
-              }).catch(function() {});
-            }
-          }
-        });
-        // Save state after images are uploaded
-        setTimeout(savePageState, 15000);
-      }, 1000);
+      _loaded = true;
+      console.log('Restored from server');
     }
     if (callback) callback();
+    setTimeout(startObserver, 500);
   }).catch(function(e) {
-    console.warn('Load state failed:', e);
+    console.warn('Load fail:', e);
     if (callback) callback();
+    setTimeout(startObserver, 500);
   });
 }
 
-// Auto-save on any DOM mutation (text edits, deletions, additions)
-var _observer = new MutationObserver(function(mutations) {
-  var dominated = false;
-  for (var i = 0; i < mutations.length; i++) {
-    var m = mutations[i];
-    // Skip our own style changes for toolbar hiding
-    if (m.type === 'attributes' && m.attributeName === 'style') continue;
-    dominated = true;
-    break;
-  }
-  if (dominated) scheduleAutoSave();
-});
-_observer.observe(document.body, {
-  childList: true,
-  subtree: true,
-  characterData: true,
-  attributes: true,
-  attributeFilter: ['class', 'contenteditable']
-});
+function startObserver() {
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      if (muts[i].type === 'attributes' && muts[i].attributeName === 'style') continue;
+      scheduleAutoSave(); return;
+    }
+  });
+  obs.observe(document.body, {
+    childList: true, subtree: true, characterData: true,
+    attributes: true, attributeFilter: ['class']
+  });
+}
 
-// Also save when contenteditable fields lose focus
 document.addEventListener('focusout', function(e) {
   if (e.target && e.target.getAttribute && e.target.getAttribute('contenteditable') === 'true') {
     scheduleAutoSave();
   }
 });
 
-// Hook upImg to also upload to server
+// Hook upImg
 var _origUpImg = upImg;
 upImg = function(z) {
-  var i = document.createElement('input');
-  i.type = 'file';
-  i.accept = 'image/*';
-  i.onchange = function(e) {
-    var f = e.target.files[0];
-    if (!f) return;
-    var r = new FileReader();
-    r.onload = function(ev) {
+  if (z.classList.contains('has-img')) {
+    var old = z.querySelector('img');
+    if (old) old.remove();
+    z.classList.remove('has-img');
+    var sid = getSlotId(z);
+    if (sid) deleteImg(sid);
+  }
+  var inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'image/*';
+  inp.onchange = function(e) {
+    var f = e.target.files[0]; if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function(ev) {
       compressImg(ev.target.result, function(compressed) {
-        z.querySelectorAll('img').forEach(function(x){ x.remove(); });
+        z.querySelectorAll('img').forEach(function(x) { x.remove(); });
         var img = document.createElement('img');
         img.src = compressed;
         z.appendChild(img);
@@ -730,34 +670,26 @@ upImg = function(z) {
           btn.textContent = getCurrentAR(z);
           z.appendChild(btn);
         }
-        // Upload to server
         var sid = getSlotId(z);
         if (sid) {
-          uploadImageToServer(sid, compressed).then(function(d) {
+          uploadImg(sid, compressed).then(function(d) {
             if (d && d.url) img.src = d.url;
             scheduleAutoSave();
           }).catch(function() { scheduleAutoSave(); });
         }
       });
     };
-    r.readAsDataURL(f);
+    rd.readAsDataURL(f);
   };
-  if (z.classList.contains('has-img')) {
-    var oldImg = z.querySelector('img');
-    if (oldImg) oldImg.remove();
-    z.classList.remove('has-img');
-    var sid = getSlotId(z);
-    if (sid) deleteImageFromServer(sid);
-  }
-  i.click();
+  inp.click();
 };
 
-// Hook rmImg to also delete from server
+// Hook rmImg
 var _origRmImg = rmImg;
 rmImg = function(z) {
   var sid = getSlotId(z);
   _origRmImg(z);
-  if (sid) deleteImageFromServer(sid);
+  if (sid) deleteImg(sid);
   scheduleAutoSave();
 };
 </script>
