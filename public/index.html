@@ -550,75 +550,128 @@ function getPageHTML() {
   return '<!DOCTYPE html>' + html;
 }
 
-function uploadBase64Images(callback) {
-  // Find all images with base64 src, upload them to server, replace with URL
-  var imgs = document.querySelectorAll('.img-slot.has-img img');
-  var pending = 0;
-  var found = false;
-  imgs.forEach(function(img) {
-    if (img.src && img.src.indexOf('data:') === 0) {
-      found = true;
-      pending++;
-      var slot = img.closest('.img-slot');
-      var slots = document.querySelectorAll('.img-slot');
-      var slotId = 'slot_0';
-      for (var i = 0; i < slots.length; i++) {
-        if (slots[i] === slot) { slotId = 'slot_' + i; break; }
-      }
-      fetch('/api/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slotId: slotId, image: img.src })
-      }).then(function(r) { return r.json(); }).then(function(data) {
-        if (data.url) img.src = data.url;
-        pending--;
-        if (pending === 0) callback();
-      }).catch(function() {
-        pending--;
-        if (pending === 0) callback();
-      });
-    }
-  });
-  if (!found) callback();
+function getSlotId(slot) {
+  var slots = document.querySelectorAll('.img-slot');
+  for (var i = 0; i < slots.length; i++) {
+    if (slots[i] === slot) return 'slot_' + i;
+  }
+  return null;
+}
+
+function uploadImageToServer(slotId, base64data) {
+  return fetch('/api/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ slotId: slotId, image: base64data })
+  }).then(function(r) { return r.json(); });
+}
+
+function deleteImageFromServer(slotId) {
+  fetch('/api/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ slotId: slotId })
+  }).catch(function(e) { console.warn('Delete failed:', e); });
 }
 
 function savePageState() {
   if (_saving) { scheduleAutoSave(); return; }
   _saving = true;
-  // First upload any base64 images to get URLs, then save HTML
-  uploadBase64Images(function() {
-    var html = getPageHTML();
-    fetch('/api/state', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ html: html })
-    }).then(function(r) { return r.json(); }).then(function(data) {
-      _saving = false;
-      if (data.ok) console.log('State saved');
-    }).catch(function(e) {
-      _saving = false;
-      console.warn('Save failed:', e);
-    });
+
+  // Strip ALL image src before saving (images are stored separately in Blob)
+  var toolbar = document.querySelector('.toolbar');
+  var addBtns = document.querySelectorAll('.add-photo-btn');
+  if (toolbar) toolbar.style.display = 'none';
+  addBtns.forEach(function(b) { b.style.display = 'none'; });
+
+  // Save original src values, replace with placeholder
+  var imgData = [];
+  document.querySelectorAll('.img-slot.has-img img').forEach(function(img) {
+    imgData.push({ el: img, src: img.src });
+    img.setAttribute('data-src-stripped', '1');
+    img.removeAttribute('src');
   });
+
+  var html = '<!DOCTYPE html>' + document.documentElement.outerHTML;
+
+  // Restore src values immediately
+  imgData.forEach(function(d) {
+    d.el.src = d.src;
+    d.el.removeAttribute('data-src-stripped');
+  });
+  if (toolbar) toolbar.style.display = '';
+  addBtns.forEach(function(b) { b.style.display = ''; });
+
+  fetch('/api/state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ html: html })
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    _saving = false;
+    if (data.ok) console.log('State saved');
+    else console.warn('State save response:', data);
+  }).catch(function(e) {
+    _saving = false;
+    console.warn('Save failed:', e);
+  });
+}
+
+function restoreImagesFromServer() {
+  fetch('/api/images').then(function(r) { return r.json(); }).then(function(data) {
+    var slots = document.querySelectorAll('.img-slot');
+    Object.keys(data).forEach(function(key) {
+      if (key === 'page-state') return; // skip state file
+      var idx = parseInt(key.replace('slot_', ''), 10);
+      if (isNaN(idx) || idx >= slots.length) return;
+      var slot = slots[idx];
+      if (!slot.classList.contains('has-img')) return; // only fill slots marked has-img
+      var img = slot.querySelector('img');
+      if (img && (!img.src || img.hasAttribute('data-src-stripped') || img.src === window.location.href)) {
+        img.src = data[key];
+      } else if (!img && data[key]) {
+        img = document.createElement('img');
+        img.src = data[key];
+        slot.appendChild(img);
+      }
+    });
+    console.log('Images restored from server');
+  }).catch(function(e) { console.warn('Image restore failed:', e); });
 }
 
 function loadPageState(callback) {
   fetch('/api/state').then(function(r) { return r.json(); }).then(function(data) {
     if (data.state && data.state.html && data.state.html.length > 500 && data.state.html.indexOf('class="hero"') !== -1) {
-      // Replace entire page with saved state
       var parser = new DOMParser();
       var doc = parser.parseFromString(data.state.html, 'text/html');
-      // Pause observer while restoring
       _observer.disconnect();
       document.body.innerHTML = doc.body.innerHTML;
       console.log('State restored from server');
-      // Re-observe after restore
+      // Restore images from Blob storage
+      setTimeout(restoreImagesFromServer, 100);
       setTimeout(function() {
         _observer.observe(document.body, {
           childList: true, subtree: true, characterData: true,
           attributes: true, attributeFilter: ['class', 'contenteditable']
         });
-      }, 500);
+      }, 1000);
+    } else {
+      // No saved state — first load, upload existing base64 images to server
+      setTimeout(function() {
+        var imgs = document.querySelectorAll('.img-slot.has-img img');
+        imgs.forEach(function(img) {
+          if (img.src && img.src.indexOf('data:') === 0) {
+            var slot = img.closest('.img-slot');
+            var sid = getSlotId(slot);
+            if (sid) {
+              uploadImageToServer(sid, img.src).then(function(d) {
+                if (d.url) img.src = d.url;
+              }).catch(function() {});
+            }
+          }
+        });
+        // Save state after images are uploaded
+        setTimeout(savePageState, 15000);
+      }, 1000);
     }
     if (callback) callback();
   }).catch(function(e) {
@@ -653,6 +706,60 @@ document.addEventListener('focusout', function(e) {
     scheduleAutoSave();
   }
 });
+
+// Hook upImg to also upload to server
+var _origUpImg = upImg;
+upImg = function(z) {
+  var i = document.createElement('input');
+  i.type = 'file';
+  i.accept = 'image/*';
+  i.onchange = function(e) {
+    var f = e.target.files[0];
+    if (!f) return;
+    var r = new FileReader();
+    r.onload = function(ev) {
+      compressImg(ev.target.result, function(compressed) {
+        z.querySelectorAll('img').forEach(function(x){ x.remove(); });
+        var img = document.createElement('img');
+        img.src = compressed;
+        z.appendChild(img);
+        z.classList.add('has-img');
+        if (!z.querySelector('.ar-btn')) {
+          var btn = document.createElement('button');
+          btn.className = 'ar-btn';
+          btn.textContent = getCurrentAR(z);
+          z.appendChild(btn);
+        }
+        // Upload to server
+        var sid = getSlotId(z);
+        if (sid) {
+          uploadImageToServer(sid, compressed).then(function(d) {
+            if (d && d.url) img.src = d.url;
+            scheduleAutoSave();
+          }).catch(function() { scheduleAutoSave(); });
+        }
+      });
+    };
+    r.readAsDataURL(f);
+  };
+  if (z.classList.contains('has-img')) {
+    var oldImg = z.querySelector('img');
+    if (oldImg) oldImg.remove();
+    z.classList.remove('has-img');
+    var sid = getSlotId(z);
+    if (sid) deleteImageFromServer(sid);
+  }
+  i.click();
+};
+
+// Hook rmImg to also delete from server
+var _origRmImg = rmImg;
+rmImg = function(z) {
+  var sid = getSlotId(z);
+  _origRmImg(z);
+  if (sid) deleteImageFromServer(sid);
+  scheduleAutoSave();
+};
 </script>
 
 
