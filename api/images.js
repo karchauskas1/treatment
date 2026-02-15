@@ -10,6 +10,8 @@ module.exports = async function handler(req, res) {
 
     const images = {};
     for (const blob of blobs) {
+      // Skip non-image blobs like page-state.json
+      if (blob.pathname.includes('page-state')) continue;
       // Extract slotId from pathname: "treatment/slot_3.jpg" -> "slot_3"
       const match = blob.pathname.match(/treatment\/(.+)\.\w+$/);
       if (match) {

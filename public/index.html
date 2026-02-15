@@ -522,18 +522,18 @@ function initPhotoGrids() {
 window.addEventListener('load', function(){
   loadPageState(function() {
     setTimeout(initPhotoGrids, 200);
-    // On first load, migrate base64 images to server
     setTimeout(migrateBase64Images, 500);
   });
 });
 
-// ===== SIMPLE PERSISTENCE =====
+// ===== PERSISTENCE =====
 var _saveTimer = null;
 var _saving = false;
 var _loaded = false;
+var _migrating = false;
 
 function scheduleAutoSave() {
-  if (!_loaded) return;
+  if (!_loaded || _migrating) return;
   if (_saveTimer) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(savePageState, 2000);
 }
@@ -551,7 +551,10 @@ function uploadImg(slotId, base64) {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({slotId: slotId, image: base64})
-  }).then(function(r) { return r.json(); });
+  }).then(function(r) {
+    if (!r.ok) throw new Error('Upload HTTP ' + r.status);
+    return r.json();
+  });
 }
 
 function deleteImg(slotId) {
@@ -572,29 +575,77 @@ function migrateBase64Images() {
       if (sid) items.push({img: img, sid: sid, src: img.src});
     }
   });
-  if (items.length === 0) { _loaded = true; savePageState(); return; }
+  if (items.length === 0) {
+    _loaded = true;
+    console.log('No base64 images to migrate');
+    savePageState();
+    return;
+  }
+  _migrating = true;
+  console.log('Migrating ' + items.length + ' base64 images...');
   var i = 0;
+  var migrated = 0;
   function next() {
-    if (i >= items.length) { _loaded = true; savePageState(); return; }
+    if (i >= items.length) {
+      _migrating = false;
+      _loaded = true;
+      console.log('Migration done: ' + migrated + '/' + items.length + ' migrated');
+      savePageState();
+      return;
+    }
     var item = items[i++];
+    console.log('Uploading image ' + i + '/' + items.length + ' (' + item.sid + ')...');
     uploadImg(item.sid, item.src).then(function(d) {
-      if (d && d.url) item.img.src = d.url;
-      setTimeout(next, 300);
-    }).catch(function() { setTimeout(next, 300); });
+      if (d && d.url) {
+        item.img.src = d.url;
+        migrated++;
+        console.log('  OK: ' + item.sid);
+      }
+      setTimeout(next, 500);
+    }).catch(function(e) {
+      console.warn('  FAIL: ' + item.sid, e);
+      // Keep the base64 src so image still shows
+      setTimeout(next, 500);
+    });
   }
   next();
 }
 
 function savePageState() {
-  if (_saving) { scheduleAutoSave(); return; }
+  if (_saving || _migrating) { scheduleAutoSave(); return; }
   _saving = true;
+
+  // Temporarily hide UI elements
   var toolbar = document.querySelector('.toolbar');
   var addBtns = document.querySelectorAll('.add-photo-btn');
   if (toolbar) toolbar.style.display = 'none';
   addBtns.forEach(function(b) { b.style.display = 'none'; });
+
+  // Before saving: strip base64 from img tags to reduce payload size
+  // Store base64 in a data attribute so we can restore if needed
+  var base64Imgs = [];
+  document.querySelectorAll('.img-slot.has-img img').forEach(function(img) {
+    if (img.src && img.src.indexOf('data:') === 0) {
+      base64Imgs.push({img: img, original: img.src});
+      img.setAttribute('data-base64-pending', '1');
+      img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'; // 1px placeholder
+    }
+  });
+
   var html = '<!DOCTYPE html>' + document.documentElement.outerHTML;
+
+  // Restore base64 in DOM immediately after capturing HTML
+  base64Imgs.forEach(function(item) {
+    item.img.src = item.original;
+    item.img.removeAttribute('data-base64-pending');
+  });
+
   if (toolbar) toolbar.style.display = '';
   addBtns.forEach(function(b) { b.style.display = ''; });
+
+  // Check payload size - if still too large, warn but still try
+  var payloadSize = new Blob([JSON.stringify({html: html})]).size;
+  console.log('Saving state: ' + (payloadSize / 1024).toFixed(0) + 'KB');
 
   fetch('/api/state', {
     method: 'POST',
@@ -603,14 +654,69 @@ function savePageState() {
   }).then(function(r) { return r.json(); }).then(function(d) {
     _saving = false;
     console.log('Saved', d.ok ? 'ok' : d);
-  }).catch(function(e) { _saving = false; console.warn('Save fail:', e); });
+  }).catch(function(e) {
+    _saving = false;
+    console.warn('Save fail:', e);
+  });
 }
 
 function loadPageState(callback) {
   fetch('/api/state').then(function(r) { return r.json(); }).then(function(data) {
     if (data.state && data.state.html && data.state.html.length > 1000 && data.state.html.indexOf('hero') !== -1) {
       var doc = new DOMParser().parseFromString(data.state.html, 'text/html');
+      // Before applying saved state, verify it has real images (not all broken)
+      var savedImgs = doc.querySelectorAll('.img-slot.has-img img');
+      var pendingImgs = doc.querySelectorAll('img[data-base64-pending]');
+      console.log('Saved state has ' + savedImgs.length + ' images, ' + pendingImgs.length + ' pending migration');
+
       document.body.innerHTML = doc.body.innerHTML;
+
+      // Remove pending placeholders that have 1px placeholder src — those slots need re-migration
+      document.querySelectorAll('img[data-base64-pending]').forEach(function(img) {
+        // This image was saved before migration completed — remove the broken placeholder
+        // The original base64 is lost, but the slot keeps its structure
+        img.removeAttribute('data-base64-pending');
+        // If src is just a tiny placeholder, remove the image
+        if (img.src.indexOf('R0lGODlhAQABA') !== -1) {
+          var slot = img.closest('.img-slot');
+          if (slot) {
+            slot.classList.remove('has-img');
+            img.remove();
+            var arBtn = slot.querySelector('.ar-btn');
+            if (arBtn) arBtn.remove();
+          }
+        }
+      });
+
+      // Verify blob URLs are accessible — check a sample
+      var blobImgs = [];
+      document.querySelectorAll('.img-slot.has-img img').forEach(function(img) {
+        if (img.src && img.src.indexOf('blob.vercel-storage.com') !== -1) {
+          blobImgs.push(img);
+        }
+      });
+      // Add error handlers to all blob images
+      blobImgs.forEach(function(img) {
+        img.onerror = function() {
+          console.warn('Broken blob image, removing slot image:', img.src);
+          var slot = img.closest('.img-slot');
+          if (slot) {
+            slot.classList.remove('has-img');
+            img.remove();
+            var arBtn = slot.querySelector('.ar-btn');
+            if (arBtn) arBtn.remove();
+            var ico = slot.querySelector('.ico');
+            var lbl = slot.querySelector('.lbl');
+            if (ico) ico.style.display = '';
+            if (lbl) lbl.style.display = '';
+          }
+        };
+        // Force re-check by re-assigning src
+        var s = img.src;
+        img.src = '';
+        img.src = s;
+      });
+
       _loaded = true;
       console.log('Restored from server');
     }
@@ -626,13 +732,17 @@ function loadPageState(callback) {
 function startObserver() {
   var obs = new MutationObserver(function(muts) {
     for (var i = 0; i < muts.length; i++) {
-      if (muts[i].type === 'attributes' && muts[i].attributeName === 'style') continue;
-      scheduleAutoSave(); return;
+      var m = muts[i];
+      if (m.type === 'attributes' && m.attributeName === 'style') continue;
+      // Don't trigger save for src changes during migration
+      if (m.type === 'attributes' && m.attributeName === 'src' && _migrating) continue;
+      scheduleAutoSave();
+      return;
     }
   });
   obs.observe(document.body, {
     childList: true, subtree: true, characterData: true,
-    attributes: true, attributeFilter: ['class']
+    attributes: true, attributeFilter: ['class', 'src']
   });
 }
 
