@@ -1,0 +1,23 @@
+{
+  "name": "treatment",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/karchauskas1/treatment.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/karchauskas1/treatment/issues"
+  },
+  "homepage": "https://github.com/karchauskas1/treatment#readme",
+  "dependencies": {
+    "@vercel/blob": "^2.2.0"
+  }
+}
