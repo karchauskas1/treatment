@@ -604,13 +604,21 @@ function savePageState() {
 
 function loadPageState(callback) {
   fetch('/api/state').then(function(r) { return r.json(); }).then(function(data) {
-    if (data.state && data.state.html) {
+    if (data.state && data.state.html && data.state.html.length > 500 && data.state.html.indexOf('class="hero"') !== -1) {
       // Replace entire page with saved state
       var parser = new DOMParser();
       var doc = parser.parseFromString(data.state.html, 'text/html');
-      // Replace body content
+      // Pause observer while restoring
+      _observer.disconnect();
       document.body.innerHTML = doc.body.innerHTML;
       console.log('State restored from server');
+      // Re-observe after restore
+      setTimeout(function() {
+        _observer.observe(document.body, {
+          childList: true, subtree: true, characterData: true,
+          attributes: true, attributeFilter: ['class', 'contenteditable']
+        });
+      }, 500);
     }
     if (callback) callback();
   }).catch(function(e) {
